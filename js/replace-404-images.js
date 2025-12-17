@@ -1,13 +1,21 @@
 (function() {
   'use strict';
 
-  // URL of the placeholder image
-  const PLACEHOLDER_IMAGE = 'https://ms18-web.github.io/public-placeholder/dummy.jpg';
+  // Base URL for placeholder images
+  const PLACEHOLDER_BASE = 'https://ms18-web.github.io/public-placeholder/';
+
+  // Get appropriate placeholder image based on original src extension
+  function getPlaceholderImage(src) {
+    if (src && src.toLowerCase().endsWith('.png')) {
+      return PLACEHOLDER_BASE + 'dummy.png';
+    }
+    return PLACEHOLDER_BASE + 'dummy.jpg';
+  }
 
   // Check whether an image is 404 and replace it
   function checkAndReplaceImage(img) {
-    // Skip if it is already the placeholder
-    if (img.src === PLACEHOLDER_IMAGE) {
+    // Skip if it is already a placeholder
+    if (img.src.startsWith(PLACEHOLDER_BASE)) {
       return;
     }
 
@@ -17,14 +25,16 @@
     // Handle image load errors
     img.onerror = function() {
       console.warn('[404 Image Replacement] Failed to load image:', originalSrc);
-      this.src = PLACEHOLDER_IMAGE;
+      this.setAttribute('data-original-src', originalSrc);
+      this.src = getPlaceholderImage(originalSrc);
       this.onerror = null; // Prevent infinite loop
     };
 
     // Check images that have already failed to load
     if (img.complete && img.naturalWidth === 0) {
       console.warn('[404 Image Replacement] Image already failed:', originalSrc);
-      img.src = PLACEHOLDER_IMAGE;
+      img.setAttribute('data-original-src', originalSrc);
+      img.src = getPlaceholderImage(originalSrc);
     }
   }
 
