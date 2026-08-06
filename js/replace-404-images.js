@@ -34,22 +34,30 @@
       img.removeAttribute('sizes');
 
       // Inside a <picture>, a <source srcset> takes priority over the
-      // fallback <img> entirely, so its candidates must be disabled too
+      // fallback <img> entirely, so it must be disabled too. Only the
+      // source the browser would currently pick is disabled -- other
+      // sources gated by a non-matching `media` may still be valid
+      // (e.g. a broken mobile source must not also break the desktop one).
       const picture = img.closest('picture');
       if (picture) {
-        picture.querySelectorAll('source').forEach(function(source) {
-          source.removeAttribute('srcset');
-          source.removeAttribute('sizes');
-        });
+        const sources = picture.querySelectorAll('source');
+        for (let i = 0; i < sources.length; i++) {
+          const source = sources[i];
+          if (!source.media || window.matchMedia(source.media).matches) {
+            source.removeAttribute('srcset');
+            source.removeAttribute('sizes');
+            break;
+          }
+        }
       }
 
       img.src = getPlaceholderImage(failedSrc);
+      img.onerror = null; // Prevent an unreachable placeholder from looping
     }
 
     // Handle image load errors
     img.onerror = function() {
       replaceWithPlaceholder();
-      img.onerror = null; // Prevent infinite loop
     };
 
     // Check images that have already failed to load
