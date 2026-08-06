@@ -26,6 +26,10 @@
     img.onerror = function() {
       console.warn('[404 Image Replacement] Failed to load image:', originalSrc);
       this.setAttribute('data-original-src', originalSrc);
+      // srcset/sizes take priority over src, so they must be cleared first
+      // or the browser keeps resolving the (still-broken) srcset candidates
+      this.removeAttribute('srcset');
+      this.removeAttribute('sizes');
       this.src = getPlaceholderImage(originalSrc);
       this.onerror = null; // Prevent infinite loop
     };
@@ -34,6 +38,8 @@
     if (img.complete && img.naturalWidth === 0) {
       console.warn('[404 Image Replacement] Image already failed:', originalSrc);
       img.setAttribute('data-original-src', originalSrc);
+      img.removeAttribute('srcset');
+      img.removeAttribute('sizes');
       img.src = getPlaceholderImage(originalSrc);
     }
   }
