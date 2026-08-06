@@ -19,28 +19,42 @@
       return;
     }
 
-    // Save the original src
-    const originalSrc = img.src;
+    // Swap the failed image (and any srcset/<picture> candidates) for a placeholder
+    function replaceWithPlaceholder() {
+      // currentSrc reflects the candidate the browser actually attempted
+      // (covers plain src, srcset candidates, and <picture> sources).
+      // img.src is only a fallback for the rare case currentSrc is unset.
+      const failedSrc = img.currentSrc || img.src;
+      console.warn('[404 Image Replacement] Failed to load image:', failedSrc);
+      img.setAttribute('data-original-src', failedSrc);
+
+      // srcset/sizes take priority over src, so they must be cleared first
+      // or the browser keeps resolving the (still-broken) srcset candidates
+      img.removeAttribute('srcset');
+      img.removeAttribute('sizes');
+
+      // Inside a <picture>, a <source srcset> takes priority over the
+      // fallback <img> entirely, so its candidates must be disabled too
+      const picture = img.closest('picture');
+      if (picture) {
+        picture.querySelectorAll('source').forEach(function(source) {
+          source.removeAttribute('srcset');
+          source.removeAttribute('sizes');
+        });
+      }
+
+      img.src = getPlaceholderImage(failedSrc);
+    }
 
     // Handle image load errors
     img.onerror = function() {
-      console.warn('[404 Image Replacement] Failed to load image:', originalSrc);
-      this.setAttribute('data-original-src', originalSrc);
-      // srcset/sizes take priority over src, so they must be cleared first
-      // or the browser keeps resolving the (still-broken) srcset candidates
-      this.removeAttribute('srcset');
-      this.removeAttribute('sizes');
-      this.src = getPlaceholderImage(originalSrc);
-      this.onerror = null; // Prevent infinite loop
+      replaceWithPlaceholder();
+      img.onerror = null; // Prevent infinite loop
     };
 
     // Check images that have already failed to load
     if (img.complete && img.naturalWidth === 0) {
-      console.warn('[404 Image Replacement] Image already failed:', originalSrc);
-      img.setAttribute('data-original-src', originalSrc);
-      img.removeAttribute('srcset');
-      img.removeAttribute('sizes');
-      img.src = getPlaceholderImage(originalSrc);
+      replaceWithPlaceholder();
     }
   }
 
