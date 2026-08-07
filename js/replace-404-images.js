@@ -21,30 +21,85 @@
     }
   }
 
+  // Parse a srcset attribute into {url, raw} candidates, loosely
+  // following the WHATWG "parse a srcset attribute" algorithm: a
+  // candidate's URL is read as a run of non-whitespace characters (so
+  // an unescaped comma with no surrounding whitespace, e.g.
+  // "missing,small.jpg", stays part of the URL), and candidates are
+  // separated by a comma found while scanning the descriptor that
+  // follows the URL (so "a.jpg 1x,b.jpg 2x" splits correctly even
+  // without a space after the comma). Descriptors containing
+  // parentheses (e.g. a future `calc()`) are tolerated by not treating
+  // a comma inside them as a separator.
+  function parseSrcsetCandidates(srcset) {
+    const candidates = [];
+    const len = srcset.length;
+    let pos = 0;
+
+    function isWhitespace(ch) {
+      return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f';
+    }
+
+    while (pos < len) {
+      while (pos < len && (isWhitespace(srcset[pos]) || srcset[pos] === ',')) {
+        pos++;
+      }
+      if (pos >= len) {
+        break;
+      }
+
+      const urlStart = pos;
+      while (pos < len && !isWhitespace(srcset[pos])) {
+        pos++;
+      }
+      let url = srcset.slice(urlStart, pos);
+
+      if (url.charAt(url.length - 1) === ',') {
+        url = url.replace(/,+$/, '');
+        candidates.push({ url: url, raw: url });
+        continue; // the trailing comma(s) already act as the separator
+      }
+
+      while (pos < len && isWhitespace(srcset[pos])) {
+        pos++;
+      }
+      const descriptorStart = pos;
+      let parens = 0;
+      while (pos < len) {
+        const ch = srcset[pos];
+        if (ch === '(') {
+          parens++;
+        } else if (ch === ')') {
+          parens = Math.max(0, parens - 1);
+        } else if (ch === ',' && parens === 0) {
+          break;
+        }
+        pos++;
+      }
+      const descriptor = srcset.slice(descriptorStart, pos).trim();
+      candidates.push({ url: url, raw: descriptor ? url + ' ' + descriptor : url });
+
+      if (pos < len && srcset[pos] === ',') {
+        pos++; // consume the separator
+      }
+    }
+
+    return candidates;
+  }
+
   // Remove only the candidate matching failedUrl from el's srcset list,
   // preserving any other still-valid candidates (e.g. other widths/
   // densities). Falls back to clearing the whole srcset/sizes when no
   // candidates remain. Returns true if a matching candidate was found.
-  //
-  // Candidates are split on a comma followed by whitespace rather than
-  // on every comma: per the srcset grammar a URL is only terminated by
-  // whitespace, so an URL may itself contain an unescaped comma (e.g.
-  // "missing,small.jpg 400w, valid-large.jpg 800w") as long as no
-  // whitespace follows it. This isn't a full srcset parser, but it
-  // keeps such URLs intact instead of fragmenting them.
   function removeFailedCandidate(el, failedUrl) {
     const srcset = el.getAttribute('srcset');
     if (!srcset) {
       return false;
     }
 
-    const candidates = srcset.split(/,\s+/).map(function(entry) {
-      return entry.trim();
-    }).filter(Boolean);
-
-    const remaining = candidates.filter(function(entry) {
-      const url = entry.split(/\s+/)[0];
-      return resolveUrl(url) !== failedUrl;
+    const candidates = parseSrcsetCandidates(srcset);
+    const remaining = candidates.filter(function(candidate) {
+      return resolveUrl(candidate.url) !== failedUrl;
     });
 
     if (remaining.length === candidates.length) {
@@ -52,7 +107,9 @@
     }
 
     if (remaining.length > 0) {
-      el.setAttribute('srcset', remaining.join(', '));
+      el.setAttribute('srcset', remaining.map(function(candidate) {
+        return candidate.raw;
+      }).join(', '));
     } else {
       el.removeAttribute('srcset');
       el.removeAttribute('sizes');
@@ -79,6 +136,16 @@
       // (covers plain src, srcset candidates, and <picture> sources).
       // img.src is only a fallback for the rare case currentSrc is unset.
       const failedSrc = img.currentSrc || img.src;
+
+      if (failedSrc.startsWith(PLACEHOLDER_BASE)) {
+        // The placeholder itself failed (e.g. blocked by CSP, or the
+        // network is down). There's nothing left to substitute, so stop
+        // listening instead of reassigning the same blocked URL again
+        // and overwriting data-original-src with it.
+        img.onerror = null;
+        return;
+      }
+
       console.warn('[404 Image Replacement] Failed to load image:', failedSrc);
       img.setAttribute('data-original-src', failedSrc);
 
