@@ -6,7 +6,15 @@
 
   // Get appropriate placeholder image based on original src extension
   function getPlaceholderImage(src) {
-    if (src && src.toLowerCase().endsWith('.png')) {
+    // Look at the path only, so `icon.png?ver=2` or `sprite.png#tile` still
+    // count as PNG
+    let path = src || '';
+    try {
+      path = new URL(path, document.baseURI).pathname;
+    } catch (e) {
+      // keep the raw value
+    }
+    if (path.toLowerCase().endsWith('.png')) {
       return PLACEHOLDER_BASE + 'dummy.png';
     }
     return PLACEHOLDER_BASE + 'dummy.jpg';
@@ -206,41 +214,655 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Detached images (new Image())
+  //
+  // Libraries such as vegas preload a slide with a detached `new Image()`
+  // and only reveal the slide from its onload. When that URL is 404 the
+  // load never fires and the slider stalls on a blank slide, even after
+  // the slide's background-image has been swapped below. Patching the
+  // `src` / `srcset` setters lets us redirect such a detached image to the
+  // placeholder so its load (and the library's onload) still happens.
+  // ---------------------------------------------------------------------
+
+  const srcDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+
+  // Set src without going through our patched setter (used for our own
+  // probes and for assigning the placeholder)
+  function setNativeSrc(img, url) {
+    srcDescriptor.set.call(img, url);
+  }
+
+  // Bumped on every src/srcset assignment, so we can tell whether someone
+  // else's error handler already reassigned it (e.g. their own fallback)
+  const srcVersions = new WeakMap();
+  const watchedDetachedImages = new WeakSet();
+
+  function watchDetachedImage(img) {
+    if (watchedDetachedImages.has(img)) {
+      return;
+    }
+    watchedDetachedImages.add(img);
+
+    // Capture listeners on the target run before onerror/bubble listeners,
+    // so the version and URL recorded here are the ones the error belongs to
+    img.addEventListener('error', function() {
+      const version = srcVersions.get(img);
+      const srcAtError = img.src;
+      const srcsetAtError = img.getAttribute('srcset');
+      // currentSrc is the candidate actually requested (a srcset entry
+      // wins over src)
+      const failedSrc = img.currentSrc || img.src;
+
+      // Wait for the whole dispatch to finish so other handlers get the
+      // first chance to react to the error
+      setTimeout(function() {
+        // Another handler reassigned src/srcset: through the property
+        // (version bumped, even to the same URL as a retry) or through
+        // setAttribute (value changed). A handler that ran before this
+        // listener (an earlier capture listener) isn't caught by those
+        // snapshots, but its new request leaves the image loading or
+        // loaded rather than broken. Or the image is now in the document
+        // and handled by checkAndReplaceImage instead.
+        if (srcVersions.get(img) !== version ||
+            img.src !== srcAtError ||
+            img.getAttribute('srcset') !== srcsetAtError ||
+            !img.complete || img.naturalWidth > 0 ||
+            img.isConnected) {
+          return;
+        }
+
+        // Nothing to load, or the placeholder itself failed. data:/blob:
+        // URLs can't be a 404; libraries load them on purpose to detect
+        // image format support, and expect the error.
+        if (!failedSrc || isPlaceholderUrl(failedSrc) ||
+            failedSrc.startsWith('data:') || failedSrc.startsWith('blob:')) {
+          return;
+        }
+
+        console.warn('[404 Image Replacement] Failed to load image:', failedSrc);
+        img.setAttribute('data-original-src', failedSrc);
+        // Still-eligible srcset candidates (the img's own, or a <source> of
+        // a detached <picture>) would win over the placeholder
+        img.removeAttribute('srcset');
+        img.removeAttribute('sizes');
+        const picture = img.closest('picture');
+        if (picture) {
+          picture.querySelectorAll('source').forEach(function(source) {
+            removeFailedCandidate(source, failedSrc);
+          });
+        }
+        setNativeSrc(img, getPlaceholderImage(failedSrc));
+      }, 0);
+    }, true);
+  }
+
+  function patchImageSetter(name) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, name);
+    if (!descriptor || !descriptor.set) {
+      return;
+    }
+    try {
+      Object.defineProperty(HTMLImageElement.prototype, name, {
+        configurable: true,
+        enumerable: descriptor.enumerable,
+        get: descriptor.get,
+        set: function(value) {
+          srcVersions.set(this, (srcVersions.get(this) || 0) + 1);
+          descriptor.set.call(this, value);
+          if (!this.isConnected) {
+            watchDetachedImage(this);
+          }
+        }
+      });
+    } catch (e) {
+      // The prototype is frozen or the property non-configurable (hardened
+      // environments, another library). Leave it unpatched so the rest of
+      // the replacement still initializes.
+    }
+  }
+
+  patchImageSetter('src');
+  patchImageSetter('srcset');
+
+  // ---------------------------------------------------------------------
+  // CSS background images
+  // ---------------------------------------------------------------------
+
+  // Matches url(...) tokens in a computed background-image value. Browsers
+  // serialize computed URLs as absolute, double-quoted strings, but single-
+  // quoted and unquoted forms are accepted too.
+  const URL_TOKEN = /url\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^"')\s]*))\s*\)/g;
+
+  const PSEUDO_ELEMENTS = ['::before', '::after'];
+
+  // Resolved URL -> Promise<boolean> (true if the image loaded), so every
+  // URL is requested at most once per page
+  const backgroundProbes = new Map();
+
+  // Rules overriding pseudo-element backgrounds: selector -> {rule, el}
+  const pseudoRules = new Map();
+  let pseudoStyleElement = null;
+  let nextPseudoId = 1;
+  const PSEUDO_ID_ATTR = 'data-placeholder-bg-id';
+
+  // The marker id each element owns. The attribute alone can't be trusted:
+  // cloneNode() copies it, and markup could contain it too.
+  const pseudoIds = new WeakMap();
+
+  // Always-true :not() clauses add ID-level specificity (2 IDs each), so the
+  // override also beats an !important rule written with ID selectors
+  // (e.g. `#hero::before { ... !important }`). Their argument requires two
+  // different ids on one element, which can never match, so no page markup
+  // can make them false.
+  const PSEUDO_SPECIFICITY_BOOST = new Array(4).join(':not(#placeholder-bg-a#placeholder-bg-b)');
+
+  // Unescape a CSS string (e.g. \" or \22 ) into its literal value
+  function unescapeCss(value) {
+    return value.replace(/\\([0-9a-fA-F]{1,6}[ \t\n\r\f]?|[\s\S])/g, function(match, escaped) {
+      const hex = escaped.trim();
+      if (/^[0-9a-fA-F]+$/.test(hex)) {
+        const codePoint = parseInt(hex, 16);
+        return codePoint === 0 || codePoint > 0x10FFFF ? '\uFFFD' : String.fromCodePoint(codePoint);
+      }
+      return escaped;
+    });
+  }
+
+  // Resolve the URL captured by one URL_TOKEN match
+  function urlFromToken(doubleQuoted, singleQuoted, unquoted) {
+    const raw = doubleQuoted !== undefined ? doubleQuoted :
+      singleQuoted !== undefined ? singleQuoted : unquoted;
+    return resolveUrl(unescapeCss(raw));
+  }
+
+  // List the URLs a background-image value references
+  function extractBackgroundUrls(value) {
+    const urls = [];
+    value.replace(URL_TOKEN, function(token, doubleQuoted, singleQuoted, unquoted) {
+      urls.push(urlFromToken(doubleQuoted, singleQuoted, unquoted));
+      return token;
+    });
+    return urls;
+  }
+
+  // Whether url is one of the placeholder images themselves. Only the exact
+  // files count: other URLs under PLACEHOLDER_BASE are ordinary assets.
+  function isPlaceholderUrl(url) {
+    return url === PLACEHOLDER_BASE + 'dummy.jpg' || url === PLACEHOLDER_BASE + 'dummy.png';
+  }
+
+  // Whether a URL is worth checking (skip inline data and our placeholders)
+  function isCheckableUrl(url) {
+    return Boolean(url) &&
+      !isPlaceholderUrl(url) &&
+      !url.startsWith('data:') &&
+      !url.startsWith('blob:');
+  }
+
+  // Load url in a detached image and report whether it succeeded
+  function probeImage(url) {
+    let probe = backgroundProbes.get(url);
+    if (!probe) {
+      probe = new Promise(function(resolve) {
+        const img = new Image();
+        img.onload = function() {
+          resolve(true);
+        };
+        img.onerror = function() {
+          resolve(false);
+        };
+        setNativeSrc(img, url); // bypass the detached-image redirect above
+      });
+      backgroundProbes.set(url, probe);
+    }
+    return probe;
+  }
+
+  // Replace only the url(...) tokens that failed, keeping every other
+  // layer (gradients, image-set() siblings, working images) intact
+  function replaceFailedUrls(value, failedUrls) {
+    return value.replace(URL_TOKEN, function(token, doubleQuoted, singleQuoted, unquoted) {
+      const url = urlFromToken(doubleQuoted, singleQuoted, unquoted);
+      if (failedUrls.indexOf(url) === -1) {
+        return token;
+      }
+      return 'url("' + getPlaceholderImage(url) + '")';
+    });
+  }
+
+  function readBackground(el, pseudo) {
+    const style = getComputedStyle(el, pseudo);
+    if (pseudo) {
+      // A pseudo-element without content isn't rendered
+      const content = style.content;
+      if (!content || content === 'none' || content === 'normal') {
+        return null;
+      }
+    }
+    const value = style.backgroundImage;
+    if (!value || value === 'none' || value.indexOf('url(') === -1) {
+      return null;
+    }
+    return value;
+  }
+
+  // Whether any of failedUrls is still part of a background-image value
+  function stillShowsFailedUrl(value, failedUrls) {
+    return extractBackgroundUrls(value).some(function(url) {
+      return failedUrls.indexOf(url) !== -1;
+    });
+  }
+
+  // Override the element's own background-image inline
+  function applyElementBackground(entry) {
+    entry.el.setAttribute('data-original-bg', entry.value);
+    entry.el.style.setProperty('background-image', entry.replaced);
+  }
+
+  // An !important declaration in a stylesheet still beats a normal
+  // inline one, so retry with !important if the failed URL survived
+  function verifyElementBackground(entry) {
+    if (stillShowsFailedUrl(getComputedStyle(entry.el).backgroundImage, entry.failedUrls)) {
+      entry.el.style.setProperty('background-image', entry.replaced, 'important');
+    }
+  }
+
+  // Pseudo-elements can't be styled inline, so tag the element and inject
+  // a matching !important rule instead
+  function applyPseudoBackground(entry) {
+    const el = entry.el;
+    let id = pseudoIds.get(el);
+    if (!id) {
+      id = String(nextPseudoId++);
+      pseudoIds.set(el, id);
+    }
+    el.setAttribute(PSEUDO_ID_ATTR, id);
+    el.setAttribute('data-original-bg-' + entry.pseudo.slice(2), entry.value);
+
+    // Add or update a single rule through the CSSOM rather than rebuilding
+    // the whole stylesheet text, which would get quadratic on pages with
+    // many failed pseudo-element backgrounds
+    const sheet = ensurePseudoSheet();
+    const selector = '[' + PSEUDO_ID_ATTR + '="' + id + '"]' + PSEUDO_SPECIFICITY_BOOST + entry.pseudo;
+    let owned = pseudoRules.get(selector);
+    if (!owned) {
+      try {
+        owned = { rule: sheet.cssRules[sheet.insertRule(selector + ' {}', sheet.cssRules.length)], el: el };
+      } catch (e) {
+        return;
+      }
+      pseudoRules.set(selector, owned);
+    }
+    owned.rule.style.setProperty('background-image', entry.replaced, 'important');
+  }
+
+  // The <style> holding the pseudo-element overrides. A head manager, SPA
+  // navigation or sanitizer may remove it or clear its contents, and its
+  // rules go with it, so recreate it if needed and re-insert every rule still
+  // in use that is no longer part of the live sheet.
+  let pseudoSheetDirty = false;
+
+  function ensurePseudoSheet() {
+    if (pseudoStyleElement && pseudoStyleElement.isConnected && !pseudoSheetDirty) {
+      return pseudoStyleElement.sheet;
+    }
+    pseudoSheetDirty = false;
+    if (!pseudoStyleElement || !pseudoStyleElement.isConnected) {
+      pseudoStyleElement = document.createElement('style');
+      pseudoStyleElement.setAttribute('data-placeholder-bg', '');
+      document.head.appendChild(pseudoStyleElement);
+    }
+
+    const sheet = pseudoStyleElement.sheet;
+    pseudoRules.forEach(function(owned, selector) {
+      if (owned.rule.parentStyleSheet === sheet) {
+        return;
+      }
+      try {
+        owned.rule = sheet.cssRules[sheet.insertRule(selector + ' { ' + owned.rule.style.cssText + ' }', sheet.cssRules.length)];
+      } catch (e) {
+        pseudoRules.delete(selector);
+      }
+    });
+    return sheet;
+  }
+
+  // Drop a marker this element doesn't own (copied by cloneNode() or
+  // written in the markup), so it stops matching another element's rule
+  // and gets checked on its own
+  function releaseForeignPseudoMarker(el) {
+    const marker = el.getAttribute(PSEUDO_ID_ATTR);
+    if (marker !== null && pseudoIds.get(el) !== marker) {
+      el.removeAttribute(PSEUDO_ID_ATTR);
+      PSEUDO_ELEMENTS.forEach(function(pseudo) {
+        el.removeAttribute('data-original-bg-' + pseudo.slice(2));
+      });
+    }
+  }
+
+  // Delete the rules of elements that have left the document, so pages that
+  // keep creating and removing elements don't accumulate rules. An element
+  // that comes back is re-checked as an added node and gets its rule again.
+  let pseudoSweepScheduled = false;
+
+  function sweepDetachedPseudoRules() {
+    pseudoSweepScheduled = false;
+    const sheet = pseudoStyleElement && pseudoStyleElement.sheet;
+    pseudoRules.forEach(function(owned, selector) {
+      if (owned.el.isConnected) {
+        return;
+      }
+      const index = sheet ? Array.prototype.indexOf.call(sheet.cssRules, owned.rule) : -1;
+      if (index !== -1) {
+        sheet.deleteRule(index);
+      }
+      pseudoRules.delete(selector);
+    });
+    // Our own <style> may have been removed along with other nodes
+    if (pseudoRules.size > 0) {
+      ensurePseudoSheet();
+    }
+  }
+
+  function queuePseudoSweep() {
+    if (pseudoRules.size === 0 || pseudoSweepScheduled) {
+      return;
+    }
+    pseudoSweepScheduled = true;
+    // Wait a frame so an element that is only being moved is back in place
+    requestAnimationFrame(sweepDetachedPseudoRules);
+  }
+
+  function verifyPseudoBackground(entry) {
+    if (stillShowsFailedUrl(getComputedStyle(entry.el, entry.pseudo).backgroundImage, entry.failedUrls)) {
+      console.warn('[404 Image Replacement] Could not override background image of', entry.el, entry.pseudo);
+    }
+  }
+
+  // Replacements waiting to be applied, flushed once per frame. All reads
+  // happen before all writes (and the verification reads after them), so a
+  // burst of failures costs a couple of style recalculations instead of
+  // one per element.
+  let pendingReplacements = [];
+  let replacementFlushScheduled = false;
+
+  function flushReplacements() {
+    replacementFlushScheduled = false;
+    const entries = pendingReplacements;
+    pendingReplacements = [];
+
+    // The background may have changed while probing (e.g. a slider
+    // moved on); that change is checked separately, so don't clobber it
+    const current = entries.filter(function(entry) {
+      return entry.el.isConnected && readBackground(entry.el, entry.pseudo) === entry.value;
+    });
+
+    current.forEach(function(entry) {
+      entry.failedUrls.forEach(function(url) {
+        console.warn('[404 Image Replacement] Failed to load background image:', url);
+      });
+      entry.replaced = replaceFailedUrls(entry.value, entry.failedUrls);
+      if (entry.pseudo) {
+        applyPseudoBackground(entry);
+      } else {
+        applyElementBackground(entry);
+      }
+    });
+
+    current.forEach(function(entry) {
+      if (entry.pseudo) {
+        verifyPseudoBackground(entry);
+      } else {
+        verifyElementBackground(entry);
+      }
+    });
+  }
+
+  function queueReplacement(entry) {
+    pendingReplacements.push(entry);
+    if (!replacementFlushScheduled) {
+      replacementFlushScheduled = true;
+      requestAnimationFrame(flushReplacements);
+    }
+  }
+
+  // Check one background layer stack (the element's own or a pseudo's)
+  function checkBackground(el, pseudo) {
+    const value = readBackground(el, pseudo);
+    if (!value) {
+      return;
+    }
+
+    const urls = extractBackgroundUrls(value).filter(function(url, i, all) {
+      return isCheckableUrl(url) && all.indexOf(url) === i;
+    });
+    if (urls.length === 0) {
+      return;
+    }
+
+    Promise.all(urls.map(probeImage)).then(function(results) {
+      const failedUrls = urls.filter(function(url, i) {
+        return !results[i];
+      });
+      if (failedUrls.length > 0) {
+        queueReplacement({ el: el, pseudo: pseudo, value: value, failedUrls: failedUrls });
+      }
+    });
+  }
+
+  function checkAndReplaceBackground(el) {
+    releaseForeignPseudoMarker(el);
+    checkBackground(el, null);
+    PSEUDO_ELEMENTS.forEach(function(pseudo) {
+      checkBackground(el, pseudo);
+    });
+  }
+
+  // Check every element in the document (html and body included)
+  function checkExistingBackgrounds() {
+    Array.prototype.forEach.call(document.querySelectorAll('html, body, body *'), checkAndReplaceBackground);
+  }
+
+  // Elements waiting for a background check, flushed once per frame so a
+  // burst of mutations (e.g. a slider transition) is handled together
+  const pendingBackgroundChecks = new Set();
+  let backgroundFlushScheduled = false;
+
+  function queueBackgroundCheck(el) {
+    pendingBackgroundChecks.add(el);
+    if (backgroundFlushScheduled) {
+      return;
+    }
+    backgroundFlushScheduled = true;
+    requestAnimationFrame(function() {
+      backgroundFlushScheduled = false;
+      const elements = Array.from(pendingBackgroundChecks);
+      pendingBackgroundChecks.clear();
+      elements.forEach(checkAndReplaceBackground);
+    });
+  }
+
+  // A stylesheet added later (lazy-loaded bundles, CSS-in-JS) can change the
+  // backgrounds of elements that already exist, so rescan the whole
+  // document, coalescing bursts of additions
+  let fullRescanTimer = null;
+
+  function queueFullRescan() {
+    if (fullRescanTimer !== null) {
+      return;
+    }
+    fullRescanTimer = setTimeout(function() {
+      fullRescanTimer = null;
+      checkExistingBackgrounds();
+    }, 100);
+  }
+
+  function isStylesheetNode(node) {
+    return node.nodeName === 'STYLE' ||
+      (node.nodeName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(node.rel));
+  }
+
+  function handleAddedStylesheet(node) {
+    if (node === pseudoStyleElement) {
+      return; // our own overrides
+    }
+    // A <link> applies once loaded; a <style> applies now, but its
+    // @import-ed sheets only once its load event fires
+    node.addEventListener('load', queueFullRescan);
+    if (node.nodeName === 'STYLE') {
+      queueFullRescan();
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Wiring
+  // ---------------------------------------------------------------------
+
   // Check existing images on page load
   function checkExistingImages() {
     const images = document.querySelectorAll('img');
     images.forEach(checkAndReplaceImage);
   }
 
-  // Observe newly added images
-  function observeNewImages() {
+  // Observe newly added images, elements and stylesheets, and style/class
+  // changes that can swap a background (e.g. a slider writing a new inline
+  // style)
+  function observeChanges() {
     const observer = new MutationObserver(function(mutations) {
       mutations.forEach(function(mutation) {
+        if (mutation.type === 'attributes') {
+          const target = mutation.target;
+          const name = mutation.attributeName;
+          if (name !== 'style' && name !== 'class' &&
+              (target.nodeName === 'LINK' || target.nodeName === 'STYLE')) {
+            // rel/href/media of a <link> or <style> changed: it started or
+            // stopped being an active stylesheet (e.g. <link rel="preload"
+            // as="style" onload="this.rel='stylesheet'">, media="print" ->
+            // "all") or switched to another file (theme switchers). Either
+            // way existing elements may get different backgrounds.
+            if (target !== pseudoStyleElement) {
+              if (isStylesheetNode(target)) {
+                handleAddedStylesheet(target);
+              }
+              queueFullRescan();
+            }
+            return;
+          }
+          // On other elements (incl. href/rel, e.g. `a[href=...]`) the change
+          // can select a different background for the element itself
+          queueBackgroundCheck(target);
+          return;
+        }
+
+        // Someone else changed the contents of our own <style>, which
+        // drops the rules inserted into it; put them back
+        if ((mutation.type === 'characterData' && mutation.target.parentNode === pseudoStyleElement) ||
+            (mutation.type === 'childList' && mutation.target === pseudoStyleElement)) {
+          pseudoSheetDirty = true;
+          queuePseudoSweep();
+          return;
+        }
+
+        // The text inside an existing <style> was edited in place
+        // (firstChild.data = ..., replaceData(), ...)
+        if (mutation.type === 'characterData') {
+          const parent = mutation.target.parentNode;
+          if (parent && parent.nodeName === 'STYLE') {
+            queueFullRescan();
+          }
+          return;
+        }
+
+        // The text of an existing <style> was replaced
+        if (mutation.target.nodeName === 'STYLE' && mutation.target !== pseudoStyleElement) {
+          queueFullRescan();
+        }
+
         mutation.addedNodes.forEach(function(node) {
+          if (node.nodeType !== Node.ELEMENT_NODE) {
+            return;
+          }
+
+          if (isStylesheetNode(node)) {
+            handleAddedStylesheet(node);
+            return;
+          }
+          node.querySelectorAll('style, link').forEach(function(child) {
+            if (isStylesheetNode(child)) {
+              handleAddedStylesheet(child);
+            }
+          });
+
           if (node.nodeName === 'IMG') {
             checkAndReplaceImage(node);
-          } else if (node.querySelectorAll) {
-            const images = node.querySelectorAll('img');
-            images.forEach(checkAndReplaceImage);
+          } else {
+            node.querySelectorAll('img').forEach(checkAndReplaceImage);
+          }
+
+          queueBackgroundCheck(node);
+          node.querySelectorAll('*').forEach(queueBackgroundCheck);
+        });
+
+        if (mutation.removedNodes.length > 0) {
+          queuePseudoSweep();
+        }
+
+        // Removing a stylesheet can expose a lower-priority rule with a
+        // broken background on elements that already exist
+        mutation.removedNodes.forEach(function(node) {
+          if (node.nodeType !== Node.ELEMENT_NODE || node === pseudoStyleElement) {
+            return;
+          }
+          if (isStylesheetNode(node) ||
+              Array.prototype.some.call(node.querySelectorAll('style, link'), isStylesheetNode)) {
+            queueFullRescan();
           }
         });
       });
     });
 
-    observer.observe(document.body, {
+    // Rooted at <html> so its own class/style changes and stylesheets added
+    // to <head> are seen too
+    observer.observe(document.documentElement, {
       childList: true,
-      subtree: true
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'class', 'id', 'rel', 'href', 'media'],
+      characterData: true
+    });
+  }
+
+  function init() {
+    checkExistingImages();
+    checkExistingBackgrounds();
+    observeChanges();
+
+    // Stylesheets loaded late (async/preload tricks) can add backgrounds
+    // after DOMContentLoaded; probes are cached, so a rescan is cheap
+    if (document.readyState !== 'complete') {
+      window.addEventListener('load', checkExistingBackgrounds);
+    }
+
+    // A stylesheet still loading when this runs (e.g. this script was
+    // injected after window.load) applies later without any DOM mutation: a
+    // <link> whose sheet isn't there yet, or a <style> waiting for an
+    // @import (its load event only fires once, so this is harmless for
+    // <style> elements that have already finished)
+    document.querySelectorAll('link, style').forEach(function(node) {
+      if (node === pseudoStyleElement || !isStylesheetNode(node)) {
+        return;
+      }
+      if (node.nodeName === 'STYLE' || !node.sheet) {
+        node.addEventListener('load', queueFullRescan);
+      }
     });
   }
 
   // Run after DOM content is fully loaded
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-      checkExistingImages();
-      observeNewImages();
-    });
+    document.addEventListener('DOMContentLoaded', init);
   } else {
-    checkExistingImages();
-    observeNewImages();
+    init();
   }
 })();
