@@ -279,18 +279,24 @@
     if (!descriptor || !descriptor.set) {
       return;
     }
-    Object.defineProperty(HTMLImageElement.prototype, name, {
-      configurable: true,
-      enumerable: descriptor.enumerable,
-      get: descriptor.get,
-      set: function(value) {
-        srcVersions.set(this, (srcVersions.get(this) || 0) + 1);
-        descriptor.set.call(this, value);
-        if (!this.isConnected) {
-          watchDetachedImage(this);
+    try {
+      Object.defineProperty(HTMLImageElement.prototype, name, {
+        configurable: true,
+        enumerable: descriptor.enumerable,
+        get: descriptor.get,
+        set: function(value) {
+          srcVersions.set(this, (srcVersions.get(this) || 0) + 1);
+          descriptor.set.call(this, value);
+          if (!this.isConnected) {
+            watchDetachedImage(this);
+          }
         }
-      }
-    });
+      });
+    } catch (e) {
+      // The prototype is frozen or the property non-configurable (hardened
+      // environments, another library). Leave it unpatched so the rest of
+      // the replacement still initializes.
+    }
   }
 
   patchImageSetter('src');
@@ -321,10 +327,12 @@
   // cloneNode() copies it, and markup could contain it too.
   const pseudoIds = new WeakMap();
 
-  // Never-matching :not(#id) clauses add ID-level specificity, so the
+  // Always-true :not() clauses add ID-level specificity (2 IDs each), so the
   // override also beats an !important rule written with ID selectors
-  // (e.g. `#hero::before { ... !important }`)
-  const PSEUDO_SPECIFICITY_BOOST = new Array(6).join(':not(#placeholder-bg-never)');
+  // (e.g. `#hero::before { ... !important }`). Their argument requires two
+  // different ids on one element, which can never match, so no page markup
+  // can make them false.
+  const PSEUDO_SPECIFICITY_BOOST = new Array(4).join(':not(#placeholder-bg-a#placeholder-bg-b)');
 
   // Unescape a CSS string (e.g. \" or \22 ) into its literal value
   function unescapeCss(value) {
@@ -620,6 +628,37 @@
     });
   }
 
+  // A stylesheet added later (lazy-loaded bundles, CSS-in-JS) can change the
+  // backgrounds of elements that already exist, so rescan the whole
+  // document, coalescing bursts of additions
+  let fullRescanTimer = null;
+
+  function queueFullRescan() {
+    if (fullRescanTimer !== null) {
+      return;
+    }
+    fullRescanTimer = setTimeout(function() {
+      fullRescanTimer = null;
+      checkExistingBackgrounds();
+    }, 100);
+  }
+
+  function isStylesheetNode(node) {
+    return node.nodeName === 'STYLE' ||
+      (node.nodeName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(node.rel));
+  }
+
+  function handleAddedStylesheet(node) {
+    if (node === pseudoStyleElement) {
+      return; // our own overrides
+    }
+    if (node.nodeName === 'LINK') {
+      node.addEventListener('load', queueFullRescan);
+    } else {
+      queueFullRescan();
+    }
+  }
+
   // ---------------------------------------------------------------------
   // Wiring
   // ---------------------------------------------------------------------
@@ -630,8 +669,9 @@
     images.forEach(checkAndReplaceImage);
   }
 
-  // Observe newly added images and elements, and style/class changes that
-  // can swap a background (e.g. a slider writing a new inline style)
+  // Observe newly added images, elements and stylesheets, and style/class
+  // changes that can swap a background (e.g. a slider writing a new inline
+  // style)
   function observeChanges() {
     const observer = new MutationObserver(function(mutations) {
       mutations.forEach(function(mutation) {
@@ -640,10 +680,25 @@
           return;
         }
 
+        // The text of an existing <style> was replaced
+        if (mutation.target.nodeName === 'STYLE' && mutation.target !== pseudoStyleElement) {
+          queueFullRescan();
+        }
+
         mutation.addedNodes.forEach(function(node) {
           if (node.nodeType !== Node.ELEMENT_NODE) {
             return;
           }
+
+          if (isStylesheetNode(node)) {
+            handleAddedStylesheet(node);
+            return;
+          }
+          node.querySelectorAll('style, link').forEach(function(child) {
+            if (isStylesheetNode(child)) {
+              handleAddedStylesheet(child);
+            }
+          });
 
           if (node.nodeName === 'IMG') {
             checkAndReplaceImage(node);
@@ -661,7 +716,9 @@
       });
     });
 
-    observer.observe(document.body, {
+    // Rooted at <html> so its own class/style changes and stylesheets added
+    // to <head> are seen too
+    observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
       attributes: true,
