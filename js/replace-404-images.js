@@ -698,9 +698,10 @@
     if (node === pseudoStyleElement) {
       return; // our own overrides
     }
-    if (node.nodeName === 'LINK') {
-      node.addEventListener('load', queueFullRescan);
-    } else {
+    // A <link> applies once loaded; a <style> applies now, but its
+    // @import-ed sheets only once its load event fires
+    node.addEventListener('load', queueFullRescan);
+    if (node.nodeName === 'STYLE') {
       queueFullRescan();
     }
   }
@@ -722,22 +723,36 @@
     const observer = new MutationObserver(function(mutations) {
       mutations.forEach(function(mutation) {
         if (mutation.type === 'attributes') {
-          if (mutation.attributeName === 'rel' || mutation.attributeName === 'href') {
-            // A <link> started or stopped being a stylesheet (e.g. <link
-            // rel="preload" as="style" onload="this.rel='stylesheet'">), or
-            // a stylesheet switched to another file (theme switchers). Either
+          const target = mutation.target;
+          const name = mutation.attributeName;
+          if (name !== 'style' && name !== 'class' &&
+              (target.nodeName === 'LINK' || target.nodeName === 'STYLE')) {
+            // rel/href/media of a <link> or <style> changed: it started or
+            // stopped being an active stylesheet (e.g. <link rel="preload"
+            // as="style" onload="this.rel='stylesheet'">, media="print" ->
+            // "all") or switched to another file (theme switchers). Either
             // way existing elements may get different backgrounds.
-            if (mutation.target.nodeName === 'LINK') {
-              if (isStylesheetNode(mutation.target)) {
-                handleAddedStylesheet(mutation.target);
+            if (target !== pseudoStyleElement) {
+              if (isStylesheetNode(target)) {
+                handleAddedStylesheet(target);
               }
               queueFullRescan();
-              return;
             }
-            // On other elements (e.g. `a[href=...]`) it can still select a
-            // different background, so check the element itself below
+            return;
           }
-          queueBackgroundCheck(mutation.target);
+          // On other elements (incl. href/rel, e.g. `a[href=...]`) the change
+          // can select a different background for the element itself
+          queueBackgroundCheck(target);
+          return;
+        }
+
+        // The text inside an existing <style> was edited in place
+        // (firstChild.data = ..., replaceData(), ...)
+        if (mutation.type === 'characterData') {
+          const parent = mutation.target.parentNode;
+          if (parent && parent.nodeName === 'STYLE' && parent !== pseudoStyleElement) {
+            queueFullRescan();
+          }
           return;
         }
 
@@ -795,7 +810,8 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['style', 'class', 'rel', 'href']
+      attributeFilter: ['style', 'class', 'rel', 'href', 'media'],
+      characterData: true
     });
   }
 
