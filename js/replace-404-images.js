@@ -213,7 +213,7 @@
   // and only reveal the slide from its onload. When that URL is 404 the
   // load never fires and the slider stalls on a blank slide, even after
   // the slide's background-image has been swapped below. Patching the
-  // `src` setter lets us redirect such a detached image to the
+  // `src` / `srcset` setters lets us redirect such a detached image to the
   // placeholder so its load (and the library's onload) still happens.
   // ---------------------------------------------------------------------
 
@@ -225,8 +225,8 @@
     srcDescriptor.set.call(img, url);
   }
 
-  // Bumped on every src assignment, so we can tell whether someone else's
-  // error handler already reassigned src (e.g. their own fallback image)
+  // Bumped on every src/srcset assignment, so we can tell whether someone
+  // else's error handler already reassigned it (e.g. their own fallback)
   const srcVersions = new WeakMap();
   const watchedDetachedImages = new WeakSet();
 
@@ -240,16 +240,23 @@
     // so the version and URL recorded here are the ones the error belongs to
     img.addEventListener('error', function() {
       const version = srcVersions.get(img);
-      const failedSrc = img.src;
+      const srcAtError = img.src;
+      const srcsetAtError = img.getAttribute('srcset');
+      // currentSrc is the candidate actually requested (a srcset entry
+      // wins over src)
+      const failedSrc = img.currentSrc || img.src;
 
       // Wait for the whole dispatch to finish so other handlers get the
       // first chance to react to the error
       setTimeout(function() {
-        // Another handler reassigned src: through the property (version
-        // bumped, even to the same URL as a retry) or through
-        // setAttribute (URL changed). Or the image is now in the document
-        // and handled by checkAndReplaceImage instead.
-        if (srcVersions.get(img) !== version || img.src !== failedSrc || img.isConnected) {
+        // Another handler reassigned src/srcset: through the property
+        // (version bumped, even to the same URL as a retry) or through
+        // setAttribute (value changed). Or the image is now in the
+        // document and handled by checkAndReplaceImage instead.
+        if (srcVersions.get(img) !== version ||
+            img.src !== srcAtError ||
+            img.getAttribute('srcset') !== srcsetAtError ||
+            img.isConnected) {
           return;
         }
 
@@ -259,25 +266,35 @@
 
         console.warn('[404 Image Replacement] Failed to load image:', failedSrc);
         img.setAttribute('data-original-src', failedSrc);
+        // A still-eligible srcset candidate would win over the placeholder
+        img.removeAttribute('srcset');
+        img.removeAttribute('sizes');
         setNativeSrc(img, getPlaceholderImage(failedSrc));
       }, 0);
     }, true);
   }
 
-  if (srcDescriptor && srcDescriptor.set) {
-    Object.defineProperty(HTMLImageElement.prototype, 'src', {
+  function patchImageSetter(name) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, name);
+    if (!descriptor || !descriptor.set) {
+      return;
+    }
+    Object.defineProperty(HTMLImageElement.prototype, name, {
       configurable: true,
-      enumerable: srcDescriptor.enumerable,
-      get: srcDescriptor.get,
+      enumerable: descriptor.enumerable,
+      get: descriptor.get,
       set: function(value) {
         srcVersions.set(this, (srcVersions.get(this) || 0) + 1);
-        setNativeSrc(this, value);
+        descriptor.set.call(this, value);
         if (!this.isConnected) {
           watchDetachedImage(this);
         }
       }
     });
   }
+
+  patchImageSetter('src');
+  patchImageSetter('srcset');
 
   // ---------------------------------------------------------------------
   // CSS background images
@@ -294,10 +311,15 @@
   // URL is requested at most once per page
   const backgroundProbes = new Map();
 
-  // Rules overriding pseudo-element backgrounds, keyed by selector
+  // Rules overriding pseudo-element backgrounds: selector -> {rule, el}
   const pseudoRules = new Map();
   let pseudoStyleElement = null;
   let nextPseudoId = 1;
+  const PSEUDO_ID_ATTR = 'data-placeholder-bg-id';
+
+  // The marker id each element owns. The attribute alone can't be trusted:
+  // cloneNode() copies it, and markup could contain it too.
+  const pseudoIds = new WeakMap();
 
   // Never-matching :not(#id) clauses add ID-level specificity, so the
   // override also beats an !important rule written with ID selectors
@@ -413,11 +435,12 @@
   // a matching !important rule instead
   function applyPseudoBackground(entry) {
     const el = entry.el;
-    let id = el.getAttribute('data-placeholder-bg-id');
+    let id = pseudoIds.get(el);
     if (!id) {
       id = String(nextPseudoId++);
-      el.setAttribute('data-placeholder-bg-id', id);
+      pseudoIds.set(el, id);
     }
+    el.setAttribute(PSEUDO_ID_ATTR, id);
     el.setAttribute('data-original-bg-' + entry.pseudo.slice(2), entry.value);
 
     if (!pseudoStyleElement) {
@@ -429,18 +452,63 @@
     // Add or update a single rule through the CSSOM rather than rebuilding
     // the whole stylesheet text, which would get quadratic on pages with
     // many failed pseudo-element backgrounds
-    const selector = '[data-placeholder-bg-id="' + id + '"]' + PSEUDO_SPECIFICITY_BOOST + entry.pseudo;
-    let rule = pseudoRules.get(selector);
-    if (!rule) {
+    const selector = '[' + PSEUDO_ID_ATTR + '="' + id + '"]' + PSEUDO_SPECIFICITY_BOOST + entry.pseudo;
+    let owned = pseudoRules.get(selector);
+    if (!owned) {
       const sheet = pseudoStyleElement.sheet;
       try {
-        rule = sheet.cssRules[sheet.insertRule(selector + ' {}', sheet.cssRules.length)];
+        owned = { rule: sheet.cssRules[sheet.insertRule(selector + ' {}', sheet.cssRules.length)], el: el };
       } catch (e) {
         return;
       }
-      pseudoRules.set(selector, rule);
+      pseudoRules.set(selector, owned);
     }
-    rule.style.setProperty('background-image', entry.replaced, 'important');
+    owned.rule.style.setProperty('background-image', entry.replaced, 'important');
+  }
+
+  // Drop a marker this element doesn't own (copied by cloneNode() or
+  // written in the markup), so it stops matching another element's rule
+  // and gets checked on its own
+  function releaseForeignPseudoMarker(el) {
+    const marker = el.getAttribute(PSEUDO_ID_ATTR);
+    if (marker !== null && pseudoIds.get(el) !== marker) {
+      el.removeAttribute(PSEUDO_ID_ATTR);
+      PSEUDO_ELEMENTS.forEach(function(pseudo) {
+        el.removeAttribute('data-original-bg-' + pseudo.slice(2));
+      });
+    }
+  }
+
+  // Delete the rules of elements that have left the document, so pages that
+  // keep creating and removing elements don't accumulate rules. An element
+  // that comes back is re-checked as an added node and gets its rule again.
+  let pseudoSweepScheduled = false;
+
+  function sweepDetachedPseudoRules() {
+    pseudoSweepScheduled = false;
+    const sheet = pseudoStyleElement && pseudoStyleElement.sheet;
+    if (!sheet) {
+      return;
+    }
+    pseudoRules.forEach(function(owned, selector) {
+      if (owned.el.isConnected) {
+        return;
+      }
+      const index = Array.prototype.indexOf.call(sheet.cssRules, owned.rule);
+      if (index !== -1) {
+        sheet.deleteRule(index);
+      }
+      pseudoRules.delete(selector);
+    });
+  }
+
+  function queuePseudoSweep() {
+    if (pseudoRules.size === 0 || pseudoSweepScheduled) {
+      return;
+    }
+    pseudoSweepScheduled = true;
+    // Wait a frame so an element that is only being moved is back in place
+    requestAnimationFrame(sweepDetachedPseudoRules);
   }
 
   function verifyPseudoBackground(entry) {
@@ -521,6 +589,7 @@
   }
 
   function checkAndReplaceBackground(el) {
+    releaseForeignPseudoMarker(el);
     checkBackground(el, null);
     PSEUDO_ELEMENTS.forEach(function(pseudo) {
       checkBackground(el, pseudo);
@@ -585,6 +654,10 @@
           queueBackgroundCheck(node);
           node.querySelectorAll('*').forEach(queueBackgroundCheck);
         });
+
+        if (mutation.removedNodes.length > 0) {
+          queuePseudoSweep();
+        }
       });
     });
 
