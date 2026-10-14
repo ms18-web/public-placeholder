@@ -264,8 +264,12 @@
           return;
         }
 
-        if (!failedSrc || isPlaceholderUrl(failedSrc)) {
-          return; // nothing to load, or the placeholder itself failed
+        // Nothing to load, or the placeholder itself failed. data:/blob:
+        // URLs can't be a 404; libraries load them on purpose to detect
+        // image format support, and expect the error.
+        if (!failedSrc || isPlaceholderUrl(failedSrc) ||
+            failedSrc.startsWith('data:') || failedSrc.startsWith('blob:')) {
+          return;
         }
 
         console.warn('[404 Image Replacement] Failed to load image:', failedSrc);
@@ -710,10 +714,15 @@
     const observer = new MutationObserver(function(mutations) {
       mutations.forEach(function(mutation) {
         if (mutation.type === 'attributes') {
-          if (mutation.attributeName === 'rel') {
-            // e.g. <link rel="preload" as="style" onload="this.rel='stylesheet'">
-            if (isStylesheetNode(mutation.target)) {
-              handleAddedStylesheet(mutation.target);
+          if (mutation.attributeName === 'rel' || mutation.attributeName === 'href') {
+            // A <link> started or stopped being a stylesheet (e.g. <link
+            // rel="preload" as="style" onload="this.rel='stylesheet'">), or
+            // a stylesheet switched to another file (theme switchers). Either
+            // way existing elements may get different backgrounds.
+            if (mutation.target.nodeName === 'LINK') {
+              if (isStylesheetNode(mutation.target)) {
+                handleAddedStylesheet(mutation.target);
+              }
               queueFullRescan();
             }
             return;
@@ -776,7 +785,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['style', 'class', 'rel']
+      attributeFilter: ['style', 'class', 'rel', 'href']
     });
   }
 
