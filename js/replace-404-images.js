@@ -828,7 +828,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['style', 'class', 'rel', 'href', 'media'],
+      attributeFilter: ['style', 'class', 'id', 'rel', 'href', 'media'],
       characterData: true
     });
   }
@@ -845,10 +845,16 @@
     }
 
     // A stylesheet still loading when this runs (e.g. this script was
-    // injected after window.load) applies later without any DOM mutation
-    document.querySelectorAll('link').forEach(function(link) {
-      if (isStylesheetNode(link) && !link.sheet) {
-        link.addEventListener('load', queueFullRescan);
+    // injected after window.load) applies later without any DOM mutation: a
+    // <link> whose sheet isn't there yet, or a <style> waiting for an
+    // @import (its load event only fires once, so this is harmless for
+    // <style> elements that have already finished)
+    document.querySelectorAll('link, style').forEach(function(node) {
+      if (node === pseudoStyleElement || !isStylesheetNode(node)) {
+        return;
+      }
+      if (node.nodeName === 'STYLE' || !node.sheet) {
+        node.addEventListener('load', queueFullRescan);
       }
     });
   }
