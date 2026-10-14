@@ -497,19 +497,28 @@
     owned.rule.style.setProperty('background-image', entry.replaced, 'important');
   }
 
-  // The <style> holding the pseudo-element overrides. A head manager or SPA
-  // navigation may remove it, and its rules go with it, so recreate it and
-  // re-insert every rule still in use.
+  // The <style> holding the pseudo-element overrides. A head manager, SPA
+  // navigation or sanitizer may remove it or clear its contents, and its
+  // rules go with it, so recreate it if needed and re-insert every rule still
+  // in use that is no longer part of the live sheet.
+  let pseudoSheetDirty = false;
+
   function ensurePseudoSheet() {
-    if (pseudoStyleElement && pseudoStyleElement.isConnected) {
+    if (pseudoStyleElement && pseudoStyleElement.isConnected && !pseudoSheetDirty) {
       return pseudoStyleElement.sheet;
     }
-    pseudoStyleElement = document.createElement('style');
-    pseudoStyleElement.setAttribute('data-placeholder-bg', '');
-    document.head.appendChild(pseudoStyleElement);
+    pseudoSheetDirty = false;
+    if (!pseudoStyleElement || !pseudoStyleElement.isConnected) {
+      pseudoStyleElement = document.createElement('style');
+      pseudoStyleElement.setAttribute('data-placeholder-bg', '');
+      document.head.appendChild(pseudoStyleElement);
+    }
 
     const sheet = pseudoStyleElement.sheet;
     pseudoRules.forEach(function(owned, selector) {
+      if (owned.rule.parentStyleSheet === sheet) {
+        return;
+      }
       try {
         owned.rule = sheet.cssRules[sheet.insertRule(selector + ' { ' + owned.rule.style.cssText + ' }', sheet.cssRules.length)];
       } catch (e) {
@@ -746,11 +755,20 @@
           return;
         }
 
+        // Someone else changed the contents of our own <style>, which
+        // drops the rules inserted into it; put them back
+        if ((mutation.type === 'characterData' && mutation.target.parentNode === pseudoStyleElement) ||
+            (mutation.type === 'childList' && mutation.target === pseudoStyleElement)) {
+          pseudoSheetDirty = true;
+          queuePseudoSweep();
+          return;
+        }
+
         // The text inside an existing <style> was edited in place
         // (firstChild.data = ..., replaceData(), ...)
         if (mutation.type === 'characterData') {
           const parent = mutation.target.parentNode;
-          if (parent && parent.nodeName === 'STYLE' && parent !== pseudoStyleElement) {
+          if (parent && parent.nodeName === 'STYLE') {
             queueFullRescan();
           }
           return;
@@ -825,6 +843,14 @@
     if (document.readyState !== 'complete') {
       window.addEventListener('load', checkExistingBackgrounds);
     }
+
+    // A stylesheet still loading when this runs (e.g. this script was
+    // injected after window.load) applies later without any DOM mutation
+    document.querySelectorAll('link').forEach(function(link) {
+      if (isStylesheetNode(link) && !link.sheet) {
+        link.addEventListener('load', queueFullRescan);
+      }
+    });
   }
 
   // Run after DOM content is fully loaded
