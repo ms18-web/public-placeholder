@@ -251,24 +251,35 @@
       setTimeout(function() {
         // Another handler reassigned src/srcset: through the property
         // (version bumped, even to the same URL as a retry) or through
-        // setAttribute (value changed). Or the image is now in the
-        // document and handled by checkAndReplaceImage instead.
+        // setAttribute (value changed). A handler that ran before this
+        // listener (an earlier capture listener) isn't caught by those
+        // snapshots, but its new request leaves the image loading or
+        // loaded rather than broken. Or the image is now in the document
+        // and handled by checkAndReplaceImage instead.
         if (srcVersions.get(img) !== version ||
             img.src !== srcAtError ||
             img.getAttribute('srcset') !== srcsetAtError ||
+            !img.complete || img.naturalWidth > 0 ||
             img.isConnected) {
           return;
         }
 
-        if (!failedSrc || failedSrc.startsWith(PLACEHOLDER_BASE)) {
+        if (!failedSrc || isPlaceholderUrl(failedSrc)) {
           return; // nothing to load, or the placeholder itself failed
         }
 
         console.warn('[404 Image Replacement] Failed to load image:', failedSrc);
         img.setAttribute('data-original-src', failedSrc);
-        // A still-eligible srcset candidate would win over the placeholder
+        // Still-eligible srcset candidates (the img's own, or a <source> of
+        // a detached <picture>) would win over the placeholder
         img.removeAttribute('srcset');
         img.removeAttribute('sizes');
+        const picture = img.closest('picture');
+        if (picture) {
+          picture.querySelectorAll('source').forEach(function(source) {
+            removeFailedCandidate(source, failedSrc);
+          });
+        }
         setNativeSrc(img, getPlaceholderImage(failedSrc));
       }, 0);
     }, true);
@@ -363,10 +374,16 @@
     return urls;
   }
 
+  // Whether url is one of the placeholder images themselves. Only the exact
+  // files count: other URLs under PLACEHOLDER_BASE are ordinary assets.
+  function isPlaceholderUrl(url) {
+    return url === PLACEHOLDER_BASE + 'dummy.jpg' || url === PLACEHOLDER_BASE + 'dummy.png';
+  }
+
   // Whether a URL is worth checking (skip inline data and our placeholders)
   function isCheckableUrl(url) {
     return Boolean(url) &&
-      !url.startsWith(PLACEHOLDER_BASE) &&
+      !isPlaceholderUrl(url) &&
       !url.startsWith('data:') &&
       !url.startsWith('blob:');
   }
@@ -713,6 +730,18 @@
         if (mutation.removedNodes.length > 0) {
           queuePseudoSweep();
         }
+
+        // Removing a stylesheet can expose a lower-priority rule with a
+        // broken background on elements that already exist
+        mutation.removedNodes.forEach(function(node) {
+          if (node.nodeType !== Node.ELEMENT_NODE || node === pseudoStyleElement) {
+            return;
+          }
+          if (isStylesheetNode(node) ||
+              Array.prototype.some.call(node.querySelectorAll('style, link'), isStylesheetNode)) {
+            queueFullRescan();
+          }
+        });
       });
     });
 
