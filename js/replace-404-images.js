@@ -237,20 +237,22 @@
     watchedDetachedImages.add(img);
 
     // Capture listeners on the target run before onerror/bubble listeners,
-    // so the version recorded here is the one the error belongs to
+    // so the version and URL recorded here are the ones the error belongs to
     img.addEventListener('error', function() {
       const version = srcVersions.get(img);
+      const failedSrc = img.src;
 
       // Wait for the whole dispatch to finish so other handlers get the
       // first chance to react to the error
       setTimeout(function() {
-        if (srcVersions.get(img) !== version || img.isConnected) {
-          // src was reassigned by another handler, or the image is now in
-          // the document and handled by checkAndReplaceImage instead
+        // Another handler reassigned src: through the property (version
+        // bumped, even to the same URL as a retry) or through
+        // setAttribute (URL changed). Or the image is now in the document
+        // and handled by checkAndReplaceImage instead.
+        if (srcVersions.get(img) !== version || img.src !== failedSrc || img.isConnected) {
           return;
         }
 
-        const failedSrc = img.src;
         if (!failedSrc || failedSrc.startsWith(PLACEHOLDER_BASE)) {
           return; // nothing to load, or the placeholder itself failed
         }
@@ -296,6 +298,11 @@
   const pseudoRules = new Map();
   let pseudoStyleElement = null;
   let nextPseudoId = 1;
+
+  // Never-matching :not(#id) clauses add ID-level specificity, so the
+  // override also beats an !important rule written with ID selectors
+  // (e.g. `#hero::before { ... !important }`)
+  const PSEUDO_SPECIFICITY_BOOST = new Array(6).join(':not(#placeholder-bg-never)');
 
   // Unescape a CSS string (e.g. \" or \22 ) into its literal value
   function unescapeCss(value) {
@@ -381,31 +388,37 @@
     return value;
   }
 
-  // Override the element's own background-image inline
-  function applyElementBackground(el, original, replaced, failedUrls) {
-    el.setAttribute('data-original-bg', original);
-    el.style.setProperty('background-image', replaced);
+  // Whether any of failedUrls is still part of a background-image value
+  function stillShowsFailedUrl(value, failedUrls) {
+    return extractBackgroundUrls(value).some(function(url) {
+      return failedUrls.indexOf(url) !== -1;
+    });
+  }
 
-    // An !important declaration in a stylesheet still beats a normal
-    // inline one, so retry with !important if the failed URL survived
-    const stillFailing = extractBackgroundUrls(getComputedStyle(el).backgroundImage)
-      .some(function(url) {
-        return failedUrls.indexOf(url) !== -1;
-      });
-    if (stillFailing) {
-      el.style.setProperty('background-image', replaced, 'important');
+  // Override the element's own background-image inline
+  function applyElementBackground(entry) {
+    entry.el.setAttribute('data-original-bg', entry.value);
+    entry.el.style.setProperty('background-image', entry.replaced);
+  }
+
+  // An !important declaration in a stylesheet still beats a normal
+  // inline one, so retry with !important if the failed URL survived
+  function verifyElementBackground(entry) {
+    if (stillShowsFailedUrl(getComputedStyle(entry.el).backgroundImage, entry.failedUrls)) {
+      entry.el.style.setProperty('background-image', entry.replaced, 'important');
     }
   }
 
   // Pseudo-elements can't be styled inline, so tag the element and inject
   // a matching !important rule instead
-  function applyPseudoBackground(el, pseudo, original, replaced) {
+  function applyPseudoBackground(entry) {
+    const el = entry.el;
     let id = el.getAttribute('data-placeholder-bg-id');
     if (!id) {
       id = String(nextPseudoId++);
       el.setAttribute('data-placeholder-bg-id', id);
     }
-    el.setAttribute('data-original-bg-' + pseudo.slice(2), original);
+    el.setAttribute('data-original-bg-' + entry.pseudo.slice(2), entry.value);
 
     if (!pseudoStyleElement) {
       pseudoStyleElement = document.createElement('style');
@@ -413,16 +426,74 @@
       document.head.appendChild(pseudoStyleElement);
     }
 
-    pseudoRules.set(
-      '[data-placeholder-bg-id="' + id + '"]' + pseudo,
-      'background-image: ' + replaced + ' !important;'
-    );
+    // Add or update a single rule through the CSSOM rather than rebuilding
+    // the whole stylesheet text, which would get quadratic on pages with
+    // many failed pseudo-element backgrounds
+    const selector = '[data-placeholder-bg-id="' + id + '"]' + PSEUDO_SPECIFICITY_BOOST + entry.pseudo;
+    let rule = pseudoRules.get(selector);
+    if (!rule) {
+      const sheet = pseudoStyleElement.sheet;
+      try {
+        rule = sheet.cssRules[sheet.insertRule(selector + ' {}', sheet.cssRules.length)];
+      } catch (e) {
+        return;
+      }
+      pseudoRules.set(selector, rule);
+    }
+    rule.style.setProperty('background-image', entry.replaced, 'important');
+  }
 
-    let css = '';
-    pseudoRules.forEach(function(declaration, selector) {
-      css += selector + ' { ' + declaration + ' }\n';
+  function verifyPseudoBackground(entry) {
+    if (stillShowsFailedUrl(getComputedStyle(entry.el, entry.pseudo).backgroundImage, entry.failedUrls)) {
+      console.warn('[404 Image Replacement] Could not override background image of', entry.el, entry.pseudo);
+    }
+  }
+
+  // Replacements waiting to be applied, flushed once per frame. All reads
+  // happen before all writes (and the verification reads after them), so a
+  // burst of failures costs a couple of style recalculations instead of
+  // one per element.
+  let pendingReplacements = [];
+  let replacementFlushScheduled = false;
+
+  function flushReplacements() {
+    replacementFlushScheduled = false;
+    const entries = pendingReplacements;
+    pendingReplacements = [];
+
+    // The background may have changed while probing (e.g. a slider
+    // moved on); that change is checked separately, so don't clobber it
+    const current = entries.filter(function(entry) {
+      return entry.el.isConnected && readBackground(entry.el, entry.pseudo) === entry.value;
     });
-    pseudoStyleElement.textContent = css;
+
+    current.forEach(function(entry) {
+      entry.failedUrls.forEach(function(url) {
+        console.warn('[404 Image Replacement] Failed to load background image:', url);
+      });
+      entry.replaced = replaceFailedUrls(entry.value, entry.failedUrls);
+      if (entry.pseudo) {
+        applyPseudoBackground(entry);
+      } else {
+        applyElementBackground(entry);
+      }
+    });
+
+    current.forEach(function(entry) {
+      if (entry.pseudo) {
+        verifyPseudoBackground(entry);
+      } else {
+        verifyElementBackground(entry);
+      }
+    });
+  }
+
+  function queueReplacement(entry) {
+    pendingReplacements.push(entry);
+    if (!replacementFlushScheduled) {
+      replacementFlushScheduled = true;
+      requestAnimationFrame(flushReplacements);
+    }
   }
 
   // Check one background layer stack (the element's own or a pseudo's)
@@ -443,25 +514,8 @@
       const failedUrls = urls.filter(function(url, i) {
         return !results[i];
       });
-      if (failedUrls.length === 0) {
-        return;
-      }
-
-      // The background may have changed while probing (e.g. a slider
-      // moved on); that change is checked separately, so don't clobber it
-      if (!el.isConnected || readBackground(el, pseudo) !== value) {
-        return;
-      }
-
-      failedUrls.forEach(function(url) {
-        console.warn('[404 Image Replacement] Failed to load background image:', url);
-      });
-
-      const replaced = replaceFailedUrls(value, failedUrls);
-      if (pseudo) {
-        applyPseudoBackground(el, pseudo, value, replaced);
-      } else {
-        applyElementBackground(el, value, replaced, failedUrls);
+      if (failedUrls.length > 0) {
+        queueReplacement({ el: el, pseudo: pseudo, value: value, failedUrls: failedUrls });
       }
     });
   }
