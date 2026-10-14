@@ -468,19 +468,13 @@
     el.setAttribute(PSEUDO_ID_ATTR, id);
     el.setAttribute('data-original-bg-' + entry.pseudo.slice(2), entry.value);
 
-    if (!pseudoStyleElement) {
-      pseudoStyleElement = document.createElement('style');
-      pseudoStyleElement.setAttribute('data-placeholder-bg', '');
-      document.head.appendChild(pseudoStyleElement);
-    }
-
     // Add or update a single rule through the CSSOM rather than rebuilding
     // the whole stylesheet text, which would get quadratic on pages with
     // many failed pseudo-element backgrounds
+    const sheet = ensurePseudoSheet();
     const selector = '[' + PSEUDO_ID_ATTR + '="' + id + '"]' + PSEUDO_SPECIFICITY_BOOST + entry.pseudo;
     let owned = pseudoRules.get(selector);
     if (!owned) {
-      const sheet = pseudoStyleElement.sheet;
       try {
         owned = { rule: sheet.cssRules[sheet.insertRule(selector + ' {}', sheet.cssRules.length)], el: el };
       } catch (e) {
@@ -489,6 +483,28 @@
       pseudoRules.set(selector, owned);
     }
     owned.rule.style.setProperty('background-image', entry.replaced, 'important');
+  }
+
+  // The <style> holding the pseudo-element overrides. A head manager or SPA
+  // navigation may remove it, and its rules go with it, so recreate it and
+  // re-insert every rule still in use.
+  function ensurePseudoSheet() {
+    if (pseudoStyleElement && pseudoStyleElement.isConnected) {
+      return pseudoStyleElement.sheet;
+    }
+    pseudoStyleElement = document.createElement('style');
+    pseudoStyleElement.setAttribute('data-placeholder-bg', '');
+    document.head.appendChild(pseudoStyleElement);
+
+    const sheet = pseudoStyleElement.sheet;
+    pseudoRules.forEach(function(owned, selector) {
+      try {
+        owned.rule = sheet.cssRules[sheet.insertRule(selector + ' { ' + owned.rule.style.cssText + ' }', sheet.cssRules.length)];
+      } catch (e) {
+        pseudoRules.delete(selector);
+      }
+    });
+    return sheet;
   }
 
   // Drop a marker this element doesn't own (copied by cloneNode() or
@@ -512,19 +528,20 @@
   function sweepDetachedPseudoRules() {
     pseudoSweepScheduled = false;
     const sheet = pseudoStyleElement && pseudoStyleElement.sheet;
-    if (!sheet) {
-      return;
-    }
     pseudoRules.forEach(function(owned, selector) {
       if (owned.el.isConnected) {
         return;
       }
-      const index = Array.prototype.indexOf.call(sheet.cssRules, owned.rule);
+      const index = sheet ? Array.prototype.indexOf.call(sheet.cssRules, owned.rule) : -1;
       if (index !== -1) {
         sheet.deleteRule(index);
       }
       pseudoRules.delete(selector);
     });
+    // Our own <style> may have been removed along with other nodes
+    if (pseudoRules.size > 0) {
+      ensurePseudoSheet();
+    }
   }
 
   function queuePseudoSweep() {
@@ -693,6 +710,14 @@
     const observer = new MutationObserver(function(mutations) {
       mutations.forEach(function(mutation) {
         if (mutation.type === 'attributes') {
+          if (mutation.attributeName === 'rel') {
+            // e.g. <link rel="preload" as="style" onload="this.rel='stylesheet'">
+            if (isStylesheetNode(mutation.target)) {
+              handleAddedStylesheet(mutation.target);
+              queueFullRescan();
+            }
+            return;
+          }
           queueBackgroundCheck(mutation.target);
           return;
         }
@@ -751,7 +776,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['style', 'class']
+      attributeFilter: ['style', 'class', 'rel']
     });
   }
 
