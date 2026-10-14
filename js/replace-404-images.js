@@ -6,7 +6,15 @@
 
   // Get appropriate placeholder image based on original src extension
   function getPlaceholderImage(src) {
-    if (src && src.toLowerCase().endsWith('.png')) {
+    // Look at the path only, so `icon.png?ver=2` or `sprite.png#tile` still
+    // count as PNG
+    let path = src || '';
+    try {
+      path = new URL(path, document.baseURI).pathname;
+    } catch (e) {
+      // keep the raw value
+    }
+    if (path.toLowerCase().endsWith('.png')) {
       return PLACEHOLDER_BASE + 'dummy.png';
     }
     return PLACEHOLDER_BASE + 'dummy.jpg';
@@ -724,8 +732,10 @@
                 handleAddedStylesheet(mutation.target);
               }
               queueFullRescan();
+              return;
             }
-            return;
+            // On other elements (e.g. `a[href=...]`) it can still select a
+            // different background, so check the element itself below
           }
           queueBackgroundCheck(mutation.target);
           return;
